@@ -1,0 +1,216 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Happy path: install a real, attested cli/cli release on Linux and Windows
+  # and prove the installed binary actually runs.
+  install-success:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_suffix: linux_amd64.tar.gz
+            exe_suffix: linux_amd64/bin/gh
+          - os: windows-latest
+            asset_suffix: windows_amd64.zip
+            exe_suffix: windows_amd64/bin/gh.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve latest cli/cli release
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          EXE_SUFFIX: ${{ matrix.exe_suffix }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo cli/cli --json tagName -q .tagName)"
+          ver="${tag#v}"
+          {
+            echo "tag=$tag"
+            echo "asset=gh_${ver}_${ASSET_SUFFIX}"
+            echo "checksums=gh_${ver}_checksums.txt"
+            echo "exe=gh_${ver}_${EXE_SUFFIX}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download, verify & install
+        id: dvi
+        uses: ./
+        with:
+          source-repository: cli/cli
+          tag: ${{ steps.meta.outputs.tag }}
+          asset: ${{ steps.meta.outputs.asset }}
+          checksum-asset: ${{ steps.meta.outputs.checksums }}
+          executable-path: ${{ steps.meta.outputs.exe }}
+          expected-signer-workflow: cli/cli/.github/workflows/deployment.yml
+          add-to-path: true
+          token: ${{ github.token }}
+
+      - name: Assert the installed binary runs
+        shell: bash
+        env:
+          EXE: ${{ steps.dvi.outputs.executable }}
+          INSTALL_DIR: ${{ steps.dvi.outputs.install-dir }}
+        run: |
+          set -euo pipefail
+          test -n "$EXE"
+          test -n "$INSTALL_DIR"
+          test -f "$EXE"
+          "$EXE" --version
+
+  # Failure paths: every one MUST be rejected by the action (no bypass/fallback).
+  reject-invalid:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Valid archive + attestation, but a wrong expected SHA256.
+          - case: bad-checksum
+            use_asset: archive
+            expected_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+            signer_workflow: cli/cli/.github/workflows/deployment.yml
+          # The checksums file is a real asset that cli/cli does NOT attest.
+          - case: missing-attestation
+            use_asset: checksums
+            expected_sha256: ""
+            signer_workflow: cli/cli/.github/workflows/deployment.yml
+          # Valid archive + attestation, but an unexpected producer identity.
+          - case: unexpected-identity
+            use_asset: archive
+            expected_sha256: ""
+            signer_workflow: cli/cli/.github/workflows/this-workflow-does-not-exist.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve latest cli/cli release
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo cli/cli --json tagName -q .tagName)"
+          ver="${tag#v}"
+          {
+            echo "tag=$tag"
+            echo "archive=gh_${ver}_linux_amd64.tar.gz"
+            echo "checksums=gh_${ver}_checksums.txt"
+            echo "exe=gh_${ver}_linux_amd64/bin/gh"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Choose asset for this case
+        id: pick
+        shell: bash
+        env:
+          USE_ASSET: ${{ matrix.use_asset }}
+          ARCHIVE: ${{ steps.meta.outputs.archive }}
+          CHECKSUMS: ${{ steps.meta.outputs.checksums }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_ASSET" = "checksums" ]; then
+            echo "asset=$CHECKSUMS" >> "$GITHUB_OUTPUT"
+          else
+            echo "asset=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt install (expected to fail)
+        id: attempt
+        continue-on-error: true
+        uses: ./
+        with:
+          source-repository: cli/cli
+          tag: ${{ steps.meta.outputs.tag }}
+          asset: ${{ steps.pick.outputs.asset }}
+          checksum-asset: ${{ steps.meta.outputs.checksums }}
+          expected-sha256: ${{ matrix.expected_sha256 }}
+          executable-path: ${{ steps.meta.outputs.exe }}
+          expected-signer-workflow: ${{ matrix.signer_workflow }}
+          token: ${{ github.token }}
+
+      - name: Assert the action rejected it
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.attempt.outcome }}
+          CASE: ${{ matrix.case }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::Expected case '$CASE' to be rejected, but the action outcome was '$OUTCOME'"
+            exit 1
+          fi
+          echo "Case '$CASE' was correctly rejected."
+
+  # Release only after the whole test suite (Linux + Windows install, all
+  # rejection cases) has succeeded, and only for pushes to main.
+  release:
+    needs: [install-success, reject-invalid]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        uses: PaulHatch/semantic-version@9f72830310d5ed81233b641ee59253644cd8a8fc # v6.0.2
+        with:
+          # Conventional Commits: breaking (type! or BREAKING CHANGE) -> major,
+          # feat -> minor, anything else -> patch. Every push bumps at least the
+          # patch component, so every push produces a release.
+          major_pattern: '/^[a-zA-Z]+(\([^)]+\))?!:|BREAKING CHANGE:/'
+          major_regexp_flags: 'm'
+          minor_pattern: '/^feat(\([^)]+\))?:/'
+          minor_regexp_flags: 'm'
+          search_commit_body: true
+          version_format: '${major}.${minor}.${patch}'
+
+      - name: Publish release and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MAJOR: ${{ steps.version.outputs.major }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          major_tag="v${MAJOR}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Immutable version tag.
+          git tag "$tag"
+          git push origin "$tag"
+          gh release create "$tag" --title "$tag" --generate-notes
+
+          # Moving major-version convenience tag (e.g. v1).
+          git tag -f "$major_tag"
+          git push -f origin "$major_tag"
+          echo "Released $tag and updated $major_tag."

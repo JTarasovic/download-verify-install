@@ -1,0 +1,40 @@
+[tools]
+actionlint = "latest"
+shellcheck = "latest"
+gh = "latest"
+# act needs a Docker daemon; install it if you want to run workflows locally.
+act = "latest"
+
+[env]
+# act runner image that ships gh/tar/node like the GitHub-hosted runners.
+ACT_IMAGE = "catthehacker/ubuntu:full-latest"
+
+[tasks.lint]
+description = "Lint workflows with actionlint (shellcheck runs on embedded scripts)"
+run = "actionlint -color"
+
+[tasks."test:success"]
+description = "act: install a real attested cli/cli release on Linux and assert it runs"
+run = """
+GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null)}" \
+act push -j install-success --matrix os:ubuntu-latest \
+  -P "ubuntu-latest=$ACT_IMAGE" -s GITHUB_TOKEN \
+  --container-architecture linux/amd64
+"""
+
+[tasks."test:reject"]
+description = "act: assert invalid checksum, missing attestation and wrong identity are rejected"
+run = """
+GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null)}" \
+act push -j reject-invalid \
+  -P "ubuntu-latest=$ACT_IMAGE" -s GITHUB_TOKEN \
+  --container-architecture linux/amd64
+"""
+
+[tasks.test]
+description = "Run the full local test suite (both act jobs)"
+depends = ["test:success", "test:reject"]
+
+[tasks.check]
+description = "Lint then run the full local test suite"
+depends = ["lint", "test"]
