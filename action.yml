@@ -1,0 +1,196 @@
+name: Download, Verify & Install Release
+description: >-
+  Download a GitHub release asset, verify its build-provenance attestation and
+  SHA256 checksum, then extract and install it into a fresh temporary directory.
+author: JTarasovic
+
+branding:
+  icon: download
+  color: green
+
+inputs:
+  source-repository:
+    description: "Producer repository the release belongs to, as <owner>/<repo>."
+    required: true
+  tag:
+    description: "Explicit release tag to download (no 'latest' resolution)."
+    required: true
+  asset:
+    description: "Exact filename of the release asset to download (.tar.gz, .tgz or .zip)."
+    required: true
+  executable-path:
+    description: "Path to the executable inside the extracted archive."
+    required: true
+  checksum-asset:
+    description: >-
+      Optional release asset containing SHA256 checksums (e.g. checksums.txt).
+      Either this or expected-sha256 must be provided.
+    required: false
+    default: ""
+  expected-sha256:
+    description: "Optional explicit expected SHA256 hex digest of the asset."
+    required: false
+    default: ""
+  expected-signer-workflow:
+    description: >-
+      Optional workflow that must have signed the attestation, as
+      [host/]<owner>/<repo>/<path/to/workflow>. Strongly recommended.
+    required: false
+    default: ""
+  expected-source-ref:
+    description: "Optional git ref the attestation must be tied to (e.g. refs/tags/v1.2.3)."
+    required: false
+    default: ""
+  expected-source-commit:
+    description: "Optional source commit SHA the attestation must be tied to."
+    required: false
+    default: ""
+  add-to-path:
+    description: "Set to 'true' to add the executable's directory to PATH."
+    required: false
+    default: "false"
+  token:
+    description: "GitHub token with read access to the producer's releases and attestations."
+    required: true
+
+outputs:
+  executable:
+    description: "Absolute path to the installed executable."
+    value: ${{ steps.install.outputs.executable }}
+  install-dir:
+    description: "Absolute path to the fresh installation directory."
+    value: ${{ steps.install.outputs.install-dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: setup
+      shell: bash
+      run: |
+        set -euo pipefail
+        base="$RUNNER_TEMP/dvi-$(date +%s)-$RANDOM"
+        download="$base/download"
+        install="$base/install"
+        mkdir -p "$download" "$install"
+        echo "download=$download" >> "$GITHUB_OUTPUT"
+        echo "install=$install" >> "$GITHUB_OUTPUT"
+
+    - id: download
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.source-repository }}
+        TAG: ${{ inputs.tag }}
+        ASSET: ${{ inputs.asset }}
+        CHECKSUM_ASSET: ${{ inputs.checksum-asset }}
+        DL: ${{ steps.setup.outputs.download }}
+      run: |
+        set -euo pipefail
+        gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir "$DL"
+        if [ ! -f "$DL/$ASSET" ]; then
+          echo "::error::Asset '$ASSET' was not downloaded from $REPO@$TAG" >&2
+          exit 1
+        fi
+        if [ -n "$CHECKSUM_ASSET" ]; then
+          gh release download "$TAG" --repo "$REPO" --pattern "$CHECKSUM_ASSET" --dir "$DL"
+        fi
+
+    - id: attest
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.source-repository }}
+        ASSET: ${{ inputs.asset }}
+        DL: ${{ steps.setup.outputs.download }}
+        SIGNER_WORKFLOW: ${{ inputs.expected-signer-workflow }}
+        SOURCE_REF: ${{ inputs.expected-source-ref }}
+        SOURCE_COMMIT: ${{ inputs.expected-source-commit }}
+      run: |
+        set -euo pipefail
+        args=( "$DL/$ASSET" --repo "$REPO" )
+        [ -n "$SIGNER_WORKFLOW" ] && args+=( --signer-workflow "$SIGNER_WORKFLOW" )
+        [ -n "$SOURCE_REF" ]      && args+=( --source-ref "$SOURCE_REF" )
+        [ -n "$SOURCE_COMMIT" ]   && args+=( --source-digest "$SOURCE_COMMIT" )
+        echo "Verifying attestation for $ASSET against $REPO"
+        gh attestation verify "${args[@]}"
+
+    - id: checksum
+      shell: bash
+      env:
+        ASSET: ${{ inputs.asset }}
+        DL: ${{ steps.setup.outputs.download }}
+        CHECKSUM_ASSET: ${{ inputs.checksum-asset }}
+        EXPECTED_SHA256: ${{ inputs.expected-sha256 }}
+      run: |
+        set -euo pipefail
+        file="$DL/$ASSET"
+        # Read from stdin so the filename is '-'; otherwise GNU sha256sum escapes
+        # backslashes in the path (Windows RUNNER_TEMP) and prefixes the line with '\'.
+        computed="$(sha256sum < "$file" | awk '{print $1}' | tr 'A-Z' 'a-z')"
+
+        if [ -n "$EXPECTED_SHA256" ]; then
+          expected="$EXPECTED_SHA256"
+        elif [ -n "$CHECKSUM_ASSET" ]; then
+          expected="$(grep -iF "$ASSET" "$DL/$CHECKSUM_ASSET" | awk '{print $1}' | head -n1)"
+        else
+          echo "::error::No checksum evidence: provide checksum-asset or expected-sha256" >&2
+          exit 1
+        fi
+
+        expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z')"
+        if [ -z "$expected" ]; then
+          echo "::error::Could not resolve an expected SHA256 for $ASSET" >&2
+          exit 1
+        fi
+        if [ "$computed" != "$expected" ]; then
+          echo "::error::SHA256 mismatch for $ASSET (computed=$computed expected=$expected)" >&2
+          exit 1
+        fi
+        echo "SHA256 verified: $computed"
+
+    - id: extract
+      shell: bash
+      env:
+        ASSET: ${{ inputs.asset }}
+        DL: ${{ steps.setup.outputs.download }}
+        INSTALL: ${{ steps.setup.outputs.install }}
+      run: |
+        set -euo pipefail
+        file="$DL/$ASSET"
+        case "$ASSET" in
+          *.tar.gz|*.tgz)
+            tar -xzf "$file" -C "$INSTALL" ;;
+          *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -q "$file" -d "$INSTALL"
+            else
+              tar -xf "$file" -C "$INSTALL"
+            fi ;;
+          *)
+            echo "::error::Unsupported archive type for '$ASSET' (expected .tar.gz, .tgz or .zip)" >&2
+            exit 1 ;;
+        esac
+
+    - id: install
+      shell: bash
+      env:
+        INSTALL: ${{ steps.setup.outputs.install }}
+        EXECUTABLE_PATH: ${{ inputs.executable-path }}
+        ADD_TO_PATH: ${{ inputs.add-to-path }}
+      run: |
+        set -euo pipefail
+        exe="$INSTALL/$EXECUTABLE_PATH"
+        if [ ! -f "$exe" ]; then
+          echo "::error::Executable not found at $exe" >&2
+          echo "Contents of $INSTALL:" >&2
+          ls -R "$INSTALL" >&2 || true
+          exit 1
+        fi
+        chmod +x "$exe" 2>/dev/null || true
+        echo "executable=$exe" >> "$GITHUB_OUTPUT"
+        echo "install-dir=$INSTALL" >> "$GITHUB_OUTPUT"
+        if [ "$ADD_TO_PATH" = "true" ]; then
+          dirname "$exe" >> "$GITHUB_PATH"
+          echo "Added $(dirname "$exe") to PATH"
+        fi
+        echo "Installed executable: $exe"

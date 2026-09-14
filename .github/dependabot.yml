@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Keep the SHA-pinned third-party actions in workflows up to date.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]
